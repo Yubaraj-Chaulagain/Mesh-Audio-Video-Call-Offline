@@ -30,7 +30,7 @@ class MainActivity : Activity() {
  private fun checkForUpdate(showNoUpdate:Boolean){
   Thread {
    try {
-    val url=URL("https://github.com/OWNER/REPO/releases/latest/download/latest.json")
+    val url=URL("https://github.com/YubarajChaulagain/MeshCallOffline/releases/latest/download/latest.json")
     val conn=url.openConnection();conn.connectTimeout=7000;conn.readTimeout=7000
     val json=JSONObject(conn.getInputStream().bufferedReader().use{it.readText()})
     val latest=json.getInt("versionCode")
