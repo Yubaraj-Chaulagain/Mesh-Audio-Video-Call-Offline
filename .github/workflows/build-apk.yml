@@ -12,6 +12,7 @@ on:
       - '*.gradle.kts'
       - 'gradle.properties'
       - 'settings.gradle'
+      - 'gradlew'
       - '.github/workflows/build-apk.yml'
 
 permissions:
@@ -31,31 +32,30 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Auto Version
         id: version
         run: |
           VERSION_CODE=${GITHUB_RUN_NUMBER}
           VERSION_NAME="1.0.${GITHUB_RUN_NUMBER}"
 
-          echo "version_code=$VERSION_CODE" >> $GITHUB_OUTPUT
-          echo "version_name=$VERSION_NAME" >> $GITHUB_OUTPUT
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+
+          echo "Building version $VERSION_NAME"
 
       - name: Build APK
         run: |
           chmod +x gradlew
           ./gradlew assembleDebug \
-          -PversionCode=${{ steps.version.outputs.version_code }} \
-          -PversionName=${{ steps.version.outputs.version_name }}
+            -PversionCode=${{ steps.version.outputs.version_code }} \
+            -PversionName=${{ steps.version.outputs.version_name }}
 
       - name: Prepare Release
         run: |
           mkdir -p release
 
           cp app/build/outputs/apk/debug/app-debug.apk \
-          release/MeshCall-Offline.apk
+            release/MeshCall-Offline.apk
 
           cat > release/latest.json << EOF
           {
@@ -78,10 +78,13 @@ jobs:
             Version Name: ${{ steps.version.outputs.version_name }}
             Version Code: ${{ steps.version.outputs.version_code }}
 
-            Download MeshCall Offline APK below.
+            Download the APK below.
+
           files: |
             release/MeshCall-Offline.apk
             release/latest.json
+
           make_latest: true
+
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
