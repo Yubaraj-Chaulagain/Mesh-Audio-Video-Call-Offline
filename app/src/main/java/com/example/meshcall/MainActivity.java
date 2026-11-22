@@ -1,0 +1,799 @@
+package com.yubaraj.walkietalkie;
+
+import android.Manifest;
+import android.app.Activity;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothDevice;
+import android.bluetooth.BluetoothManager;
+import android.bluetooth.BluetoothServerSocket;
+import android.bluetooth.BluetoothSocket;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.pm.PackageManager;
+import android.net.wifi.WifiManager;
+import android.net.wifi.WifiInfo;
+import android.net.DhcpInfo;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.view.Gravity;
+import android.view.MotionEvent;
+import android.widget.*;
+import android.graphics.Color;
+import android.media.AudioFormat;
+import android.media.AudioRecord;
+import android.media.AudioTrack;
+import android.media.MediaRecorder;
+import android.media.AudioManager;
+import android.media.AudioPlaybackCaptureConfiguration;
+import android.media.projection.MediaProjection;
+import android.media.projection.MediaProjectionManager;
+import android.media.Ringtone;
+import android.media.RingtoneManager;
+import android.media.AudioAttributes;
+import java.io.*;
+import java.net.*;
+import java.util.*;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+public class MainActivity extends Activity {
+    static MainActivity instance;
+    static final int DISCOVERY_PORT=45454, AUDIO_PORT=45455, SAMPLE_RATE=16000, CHUNK=640;
+    // Relay-tree node capacity target: 1 local host/relay + up to 13 downstream peers.
+    // Four relay nodes can therefore be arranged to serve a 50-user network target.
+    // This is a per-node admission limit, NOT a guarantee of 50 simultaneous audio streams.
+    static final int MAX_CLIENTS=13;
+    static final int REQ_PERMS=77;
+    TextView status, role, wifiLabel, btLabel;
+    Button hostBtn, rescanBtn, talkBtn, handsFreeBtn, stopBtn, nameBtn, onlineBtn, bellBtn, musicBtn, relayBtn, videoBtn;
+    EditText relayHostInput, relayBluetoothInput;
+    Button bluetoothRelayBtn;
+    static final UUID RELAY_BT_UUID=UUID.fromString("8f3a2f20-7c1b-4d91-9d0b-7f2c4e6a1001");
+    BluetoothServerSocket bluetoothServerSocket;
+    BluetoothSocket bluetoothUpstreamSocket;
+    DataOutputStream bluetoothUpstreamOut;
+    final List<BluetoothClient> bluetoothClients=new CopyOnWriteArrayList<>();
+    volatile boolean relayMode=false;
+    EditText nameInput;
+    LinearLayout wifiList, btList;
+    volatile boolean hosting=false, connected=false, talking=false, handsFree=false, running=true, connecting=false;
+    ServerSocket serverSocket;
+    final List<Client> clients=new CopyOnWriteArrayList<>();
+    Socket clientSocket;
+    DataOutputStream clientOut;
+    AudioTrack player;
+    Ringtone bellRingtone;
+    volatile boolean bellActive=false;
+    volatile boolean musicCaptureActive=false;
+    volatile boolean musicCaptureRequested=false;
+    MediaProjection mediaProjection;
+    AudioRecord musicCaptureRecord;
+    static final int REQ_MEDIA_CAPTURE=78;
+    final Handler bellHandler=new Handler(android.os.Looper.getMainLooper());
+    final Runnable bellRepeat= new Runnable(){ public void run(){ if(bellActive){ try{ if(bellRingtone!=null){ if(bellRingtone.isPlaying()) bellRingtone.stop(); bellRingtone.play(); } }catch(Throwable ignored){} bellHandler.postDelayed(this,2500); } } };
+    WifiManager.MulticastLock multicastLock;
+    final Object writeLock=new Object();
+    String hostAddress="";
+    volatile String connectedHostIp="";
+    String deviceName="Walkie Phone";
+    final Map<String,Peer> peers=Collections.synchronizedMap(new LinkedHashMap<>());
+    final Map<String,String> bluetoothPeers=Collections.synchronizedMap(new LinkedHashMap<>());
+    BluetoothAdapter btAdapter;
+    BroadcastReceiver btReceiver;
+
+
+    static class Client {
+        final Socket socket;
+        final DataOutputStream out;
+        final Object lock = new Object();
+        Client(Socket s) throws IOException {
+            socket = s;
+            out = new DataOutputStream(new BufferedOutputStream(s.getOutputStream()));
+        }
+        void send(int type, byte[] data) {
+            try {
+                synchronized (lock) {
+                    out.writeByte(type);
+                    out.writeInt(data.length);
+                    out.write(data);
+                    out.flush();
+                }
+            } catch (IOException ignored) {
+                try { socket.close(); } catch (IOException ignored2) {}
+            }
+        }
+    }
+
+    static class BluetoothClient {
+        final BluetoothSocket socket; final DataOutputStream out; final Object lock=new Object();
+        BluetoothClient(BluetoothSocket s) throws IOException { socket=s; out=new DataOutputStream(new BufferedOutputStream(s.getOutputStream())); }
+        void send(int type,byte[] data){try{synchronized(lock){out.writeByte(type);out.writeInt(data.length);out.write(data);out.flush();}}catch(IOException e){try{socket.close();}catch(Exception ignored){}}}
+    }
+
+    static class Peer {
+        String ip, name, mode;
+        long seen;
+        Peer(String i,String n,String m){ip=i;name=n;mode=m;seen=System.currentTimeMillis();}
+    }
+
+    @Override public void onCreate(Bundle b){
+        super.onCreate(b);
+        instance=this;
+        getWindow().setStatusBarColor(Color.rgb(5,18,35));
+        getWindow().setNavigationBarColor(Color.rgb(5,18,35));
+        showLogoSplash();
+        new android.os.Handler(getMainLooper()).postDelayed(() -> initializeWalkieTalkie(), 1500);
+    }
+
+    void showLogoSplash(){
+        LinearLayout splash=new LinearLayout(this);
+        splash.setOrientation(LinearLayout.VERTICAL);
+        splash.setGravity(Gravity.CENTER);
+        splash.setPadding(24,24,24,24);
+        splash.setBackgroundColor(Color.rgb(5,18,35));
+        ImageView logo=new ImageView(this);
+        logo.setImageResource(com.yubaraj.walkietalkie.R.drawable.wolketoke_logo);
+        logo.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        splash.addView(logo,new LinearLayout.LayoutParams(-1,0,1f));
+        TextView caption=new TextView(this);
+        caption.setText("WOLKETOKE WALKIE-TALKIE");
+        caption.setTextColor(Color.WHITE);
+        caption.setTextSize(20);
+        caption.setTypeface(null, android.graphics.Typeface.BOLD);
+        caption.setGravity(Gravity.CENTER);
+        caption.setPadding(0,12,0,12);
+        splash.addView(caption,new LinearLayout.LayoutParams(-1,-2));
+        setContentView(splash);
+    }
+
+    void initializeWalkieTalkie(){
+        deviceName=getPreferences(0).getString("deviceName", android.os.Build.MODEL==null?"Walkie Phone":android.os.Build.MODEL);
+        WifiManager wm=(WifiManager)getApplicationContext().getSystemService(WIFI_SERVICE);
+        if(wm!=null){try{multicastLock=wm.createMulticastLock("yubaraj-walkie");multicastLock.setReferenceCounted(false);multicastLock.acquire();}catch(Exception ignored){}}
+        BluetoothManager bm=(BluetoothManager)getSystemService(BLUETOOTH_SERVICE);
+        if(bm!=null) btAdapter=bm.getAdapter();
+        buildUI();
+        requestNeededPermissions();
+        startDiscoveryListener();
+        startAutoSearch();
+        startBluetoothScan();
+    }
+
+    void requestNeededPermissions(){
+        ArrayList<String> p=new ArrayList<>();
+        if(checkSelfPermission(Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED)p.add(Manifest.permission.RECORD_AUDIO);
+        if(Build.VERSION.SDK_INT>=31){
+            if(checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN)!=PackageManager.PERMISSION_GRANTED)p.add(Manifest.permission.BLUETOOTH_SCAN);
+            if(checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)!=PackageManager.PERMISSION_GRANTED)p.add(Manifest.permission.BLUETOOTH_CONNECT);
+        } else if(Build.VERSION.SDK_INT>=23 && checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)!=PackageManager.PERMISSION_GRANTED){
+            p.add(Manifest.permission.ACCESS_FINE_LOCATION);
+        }
+        if(!p.isEmpty())requestPermissions(p.toArray(new String[0]),REQ_PERMS);
+    }
+
+    void buildUI(){
+        ScrollView scroll=new ScrollView(this);
+        LinearLayout root=new LinearLayout(this);root.setOrientation(1);root.setPadding(22,20,22,24);root.setGravity(Gravity.CENTER_HORIZONTAL);root.setBackgroundColor(Color.rgb(16,24,39));
+        TextView title=new TextView(this);title.setText("Yubaraj Walkie-Talkie");title.setTextColor(Color.WHITE);title.setTextSize(24);title.setGravity(Gravity.CENTER);title.setPadding(0,8,0,4);root.addView(title,new LinearLayout.LayoutParams(-1,-2));
+        TextView sub=new TextView(this);sub.setText("OFFLINE: Wi-Fi / Hotspot • ONLINE: LiveKit Internet");sub.setTextColor(Color.LTGRAY);sub.setGravity(Gravity.CENTER);sub.setPadding(0,0,0,16);root.addView(sub);
+        nameInput=new EditText(this);nameInput.setSingleLine(true);nameInput.setText(deviceName);nameInput.setHint("Your display name");nameInput.setTextColor(Color.WHITE);nameInput.setHintTextColor(Color.LTGRAY);nameInput.setBackgroundTintList(android.content.res.ColorStateList.valueOf(Color.rgb(117,209,255)));root.addView(nameInput,params());
+        nameBtn=button("SAVE MY NAME");root.addView(nameBtn,params());
+        role=new TextView(this);role.setText("Searching automatically…");role.setTextColor(Color.rgb(117,209,255));role.setTextSize(16);role.setGravity(Gravity.CENTER);root.addView(role,params());
+        hostBtn=button("START OFFLINE HOST");rescanBtn=button("SEARCH OFFLINE DEVICES");onlineBtn=button("🌐 ONLINE MODE (INTERNET)");bellBtn=button("🔔 SCHOOL BELL");talkBtn=button("HOLD TO TALK");handsFreeBtn=button("🎙 HANDS-FREE: OFF");stopBtn=button("DISCONNECT");
+        root.addView(hostBtn,params());root.addView(rescanBtn,params());
+        relayHostInput=new EditText(this);relayHostInput.setSingleLine(true);relayHostInput.setHint("Main Host IP (e.g. 192.168.43.1)");relayHostInput.setInputType(android.text.InputType.TYPE_CLASS_PHONE);relayHostInput.setTextColor(Color.WHITE);relayHostInput.setHintTextColor(Color.LTGRAY);relayHostInput.setBackgroundTintList(android.content.res.ColorStateList.valueOf(Color.rgb(117,209,255)));root.addView(relayHostInput,params());
+        relayBtn=button("📡 START WI-FI RELAY MODE");root.addView(relayBtn,params());root.addView(onlineBtn,params());
+        root.addView(bellBtn,params());
+        musicBtn=button("🎵 HOLD TO SHARE MUSIC PLAYER AUDIO");
+        videoBtn=button("📹 LOCAL VIDEO CALL (HOTSPOT/Wi-Fi)");
+        root.addView(videoBtn,params());
+        musicBtn.setEnabled(false);
+        root.addView(musicBtn,params());
+        musicBtn.setOnClickListener(v -> toggleMusicCapture());
+        videoBtn.setOnClickListener(v -> startLocalVideoCall());
+        bellBtn.setEnabled(false);
+        bellBtn.setText("🔔 START SCHOOL BELL");
+        bellBtn.setBackgroundTintList(android.content.res.ColorStateList.valueOf(Color.rgb(170,105,25)));
+        bellBtn.setOnClickListener(v -> toggleSchoolBell());
+        onlineBtn.setOnClickListener(v -> startActivity(new Intent(MainActivity.this, OnlineActivity.class)));
+        wifiLabel=section("Wi-Fi / Hotspot devices");root.addView(wifiLabel);
+        wifiList=new LinearLayout(this);wifiList.setOrientation(1);root.addView(wifiList,new LinearLayout.LayoutParams(-1,-2));
+        btLabel=section("Nearby Bluetooth devices (discovery only)");root.addView(btLabel);
+        btList=new LinearLayout(this);btList.setOrientation(1);root.addView(btList,new LinearLayout.LayoutParams(-1,-2));
+        talkBtn.setEnabled(false);talkBtn.setBackgroundTintList(android.content.res.ColorStateList.valueOf(Color.rgb(43,62,88)));
+        talkBtn.setOnTouchListener((v,e)->{
+            if(handsFree)return true;
+            if(!connected&&!hosting){setStatus("पहिले एउटै Wi-Fi/Hotspot मा जोडिनुहोस् र Host खोज्नुहोस्।");return true;}
+            if(e.getAction()==MotionEvent.ACTION_DOWN){startTalking();return true;}
+            if(e.getAction()==MotionEvent.ACTION_UP||e.getAction()==MotionEvent.ACTION_CANCEL){stopTalking();return true;}
+            return true;
+        });
+        LinearLayout.LayoutParams tp=new LinearLayout.LayoutParams(240,240);tp.gravity=Gravity.CENTER;tp.setMargins(0,12,0,12);root.addView(talkBtn,tp);
+        handsFreeBtn.setEnabled(false);
+        handsFreeBtn.setBackgroundTintList(android.content.res.ColorStateList.valueOf(Color.rgb(25,105,85)));
+        handsFreeBtn.setOnClickListener(v -> toggleHandsFree());
+        root.addView(handsFreeBtn,params());
+        root.addView(stopBtn,params());
+        status=new TextView(this);status.setText("Offline mode stays available. Tap ONLINE MODE to talk over the internet.");status.setTextColor(Color.WHITE);status.setTextSize(14);status.setGravity(Gravity.CENTER);status.setPadding(0,14,0,0);root.addView(status,new LinearLayout.LayoutParams(-1,-2));
+        scroll.addView(root);setContentView(scroll);
+        hostBtn.setOnClickListener(v->startHost());
+        relayBtn.setOnClickListener(v->{String ip=relayHostInput.getText().toString().trim();if(ip.isEmpty()){setStatus("Relay सुरु गर्न Main Host को IP लेख्नुहोस्।");return;}startRelay(ip);});
+        // Bluetooth relay controls are not currently rendered in this UI.
+        // Never dereference the optional controls during startup; otherwise the app
+        // crashes immediately after the splash screen with a NullPointerException.
+        if (bluetoothRelayBtn != null && relayBluetoothInput != null) {
+            bluetoothRelayBtn.setOnClickListener(v->{String mac=relayBluetoothInput.getText().toString().trim();if(mac.isEmpty()){setStatus("पहिले Main Host को Bluetooth MAC address राख्नुहोस् र दुवै फोन Pair गर्नुहोस्।");return;}startBluetoothRelay(mac);});
+        }
+        rescanBtn.setOnClickListener(v->{renderLists();startBluetoothScan();setStatus("Searching again…");});
+        stopBtn.setOnClickListener(v->disconnectAll());
+        nameBtn.setOnClickListener(v->{String n=nameInput.getText().toString().trim();if(n.isEmpty()){setStatus("Please enter a name.");return;}deviceName=n;getPreferences(0).edit().putString("deviceName",n).apply();setStatus("Name saved: "+deviceName);if(hosting)setStatus("Name saved. Restart HOST so others see the updated name.");});
+    }
+    TextView section(String s){TextView t=new TextView(this);t.setText(s);t.setTextColor(Color.WHITE);t.setTextSize(17);t.setPadding(0,16,0,6);return t;}
+    Button button(String s){Button b=new Button(this);b.setText(s);b.setTextColor(Color.WHITE);b.setBackgroundTintList(android.content.res.ColorStateList.valueOf(Color.rgb(43,62,88)));return b;}
+    LinearLayout.LayoutParams params(){LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-1,-2);p.setMargins(0,5,0,5);return p;}
+    void setStatus(String s){runOnUiThread(()->{if(status!=null)status.setText(s);});}
+
+    void startAutoSearch(){
+        setStatus("Searching for other Yubaraj Walkie-Talkie phones automatically…");
+        new Thread(()->{while(running){renderLists();try{Thread.sleep(2500);}catch(Exception ignored){}}},"ui-refresh").start();
+        // Auto-connect as soon as a Wi-Fi host beacon appears.
+        new Thread(()->{
+            long began=System.currentTimeMillis();
+            while(running){
+                if(!hosting&&!connected&&!connecting&&!hostAddress.isEmpty()){
+                    String ip=hostAddress;hostAddress="";connectTo(ip);
+                }
+                // Hotspot APs often block UDP broadcast. On a client connected to a phone hotspot,
+                // Android's DHCP gateway is normally the hotspot phone. Probe its audio port as fallback.
+                if(!hosting&&!connected&&!connecting&&System.currentTimeMillis()-began>1500){
+                    String gateway=getGatewayIp();
+                    if(!gateway.isEmpty()&&!gateway.equals(getLocalIp())&&isHostPortOpen(gateway)){
+                        synchronized(peers){peers.put(gateway,new Peer(gateway,"Walkie-Talkie Host", "HOST"));}
+                        hostAddress=gateway;
+                        renderLists();
+                    }
+                }
+                // Only self-elect if neither UDP discovery nor hotspot-gateway probing finds a host.
+                if(!hosting&&!connected&&!connecting&&System.currentTimeMillis()-began>10000&&peers.isEmpty()){
+                    startHost(); began=System.currentTimeMillis();
+                }
+                try{Thread.sleep(1200);}catch(Exception ignored){}
+            }
+        },"auto-connect-host-election").start();
+    }
+
+    String getGatewayIp(){
+        try{
+            WifiManager wm=(WifiManager)getApplicationContext().getSystemService(WIFI_SERVICE);
+            if(wm==null)return "";
+            DhcpInfo dhcp=wm.getDhcpInfo();
+            if(dhcp==null||dhcp.gateway==0)return "";
+            int g=dhcp.gateway;
+            return (g&0xff)+"."+((g>>8)&0xff)+"."+((g>>16)&0xff)+"."+((g>>24)&0xff);
+        }catch(Exception e){return "";}
+    }
+    boolean isHostPortOpen(String ip){
+        try(Socket probe=new Socket()){
+            probe.connect(new InetSocketAddress(ip,AUDIO_PORT),350);
+            return true;
+        }catch(Exception e){return false;}
+    }
+
+    void startHost(){
+        if(checkSelfPermission(Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED){requestNeededPermissions();setStatus("Allow microphone permission, then tap START HOST.");return;}
+        if(hosting)return;
+        hosting=true;connected=true;
+        runOnUiThread(()->{role.setText("HOST MODE • "+deviceName);talkBtn.setEnabled(true);handsFreeBtn.setEnabled(true);bellBtn.setEnabled(true);musicBtn.setEnabled(true);videoBtn.setEnabled(true);hostBtn.setEnabled(false);});
+        new Thread(()->{
+            try{
+                serverSocket=new ServerSocket();serverSocket.setReuseAddress(true);serverSocket.bind(new InetSocketAddress(AUDIO_PORT));
+                setStatus("Host running as "+deviceName+". Other phones on the same hotspot will auto-connect.");
+                while(hosting){
+                    Socket s=serverSocket.accept();
+                    s.setTcpNoDelay(true);
+                    if(clients.size()+bluetoothClients.size()>=MAX_CLIENTS){
+                        try{s.close();}catch(IOException ignored){}
+                        setStatus("This node is full: maximum 13 downstream peers (14 including this host/relay).");
+                        continue;
+                    }
+                    Client c=new Client(s);
+                    clients.add(c);
+                    setStatus("Node connected: "+(clients.size()+1)+"/14 devices (host/relay included)");
+                    new Thread(()->readClient(c)).start();
+                }
+            }catch(Exception e){if(hosting)setStatus("Host error: "+e.getMessage());}
+        },"host-server").start();
+        new Thread(this::sendBeacon,"host-beacon").start();
+        startBluetoothHostServer();
+    }
+    /** Start a Wi-Fi store-and-forward relay: this phone accepts downstream clients
+     * like a Host while maintaining one upstream connection to the Main Host. */
+    void startRelay(String upstreamIp){
+        if(hosting||connected||connecting){setStatus("पहिले Disconnect गर्नुहोस्, त्यसपछि Relay सुरु गर्नुहोस्।");return;}
+        if(checkSelfPermission(Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED){requestNeededPermissions();setStatus("Relay का लागि Microphone अनुमति दिनुहोस्।");return;}
+        relayMode=true;
+        startHost();
+        runOnUiThread(()->{relayBtn.setEnabled(false);hostBtn.setEnabled(false);role.setText("RELAY MODE • UPSTREAM: "+upstreamIp);});
+        new Thread(()->{
+            try{
+                // Wait until the local downstream listener is actually bound.
+                long deadline=System.currentTimeMillis()+6000;
+                while((serverSocket==null||!serverSocket.isBound())&&System.currentTimeMillis()<deadline)Thread.sleep(100);
+                if(serverSocket==null||!serverSocket.isBound())throw new IOException("Local relay listener did not start");
+                Socket upstream=new Socket();upstream.connect(new InetSocketAddress(upstreamIp,AUDIO_PORT),7000);upstream.setTcpNoDelay(true);upstream.setKeepAlive(true);
+                clientSocket=upstream;clientOut=new DataOutputStream(new BufferedOutputStream(upstream.getOutputStream()));
+                setStatus("Relay connected to Main Host. Other phones can connect to this phone's hotspot/IP.");
+                readServer(upstream);
+            }catch(Exception e){relayMode=false;setStatus("Relay upstream connect failed: "+(e.getMessage()==null?"check Host IP and same Wi-Fi":e.getMessage()));disconnectAll();}
+        },"relay-upstream").start();
+    }
+
+    /** Bluetooth Classic server: paired phones may connect as audio peers. */
+    void startBluetoothHostServer(){
+        if(btAdapter==null)return;
+        new Thread(()->{
+            try{
+                if(Build.VERSION.SDK_INT>=31 && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)!=PackageManager.PERMISSION_GRANTED){setStatus("Bluetooth Connect permission दिनुहोस्।");return;}
+                bluetoothServerSocket=btAdapter.listenUsingRfcommWithServiceRecord("Wolketoke Relay",RELAY_BT_UUID);
+                while(hosting){BluetoothSocket socket=bluetoothServerSocket.accept();if(clients.size()+bluetoothClients.size()>=MAX_CLIENTS){try{socket.close();}catch(Exception ignored){}continue;}BluetoothClient c=new BluetoothClient(socket);bluetoothClients.add(c);setStatus("Bluetooth peer connected. Total peers: "+(clients.size()+bluetoothClients.size()));new Thread(()->readBluetoothClient(c),"bt-peer-reader").start();}
+            }catch(Exception e){if(hosting)setStatus("Bluetooth listener: "+e.getMessage());}
+        },"bluetooth-host-server").start();
+    }
+    void readBluetoothClient(BluetoothClient c){
+        try(DataInputStream in=new DataInputStream(new BufferedInputStream(c.socket.getInputStream()))){
+            while(hosting&&c.socket.isConnected()){
+                int type=in.readUnsignedByte(),len=in.readInt();if(len<0||len>8192)break;byte[] data=new byte[len];in.readFully(data);
+                if(type==1){play(data);for(Client w:clients)w.send(type,data);for(BluetoothClient b:bluetoothClients)if(b!=c)b.send(type,data);if(relayMode)sendUpstream(type,data);}
+                else if(type==2||type==3){if(type==2)startSchoolBellLocal();else stopSchoolBellLocal();for(Client w:clients)w.send(type,new byte[]{1});for(BluetoothClient b:bluetoothClients)if(b!=c)b.send(type,new byte[]{1});if(relayMode)sendUpstream(type,new byte[]{1});}
+            }
+        }catch(Exception ignored){}finally{bluetoothClients.remove(c);try{c.socket.close();}catch(Exception ignored){}}
+    }
+    /** Start a relay with Bluetooth Classic as the upstream link and Wi-Fi clients downstream. */
+    void startBluetoothRelay(String mac){
+        if(btAdapter==null){setStatus("यो मोबाइलमा Bluetooth उपलब्ध छैन।");return;}
+        if(checkSelfPermission(Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED){requestNeededPermissions();setStatus("पहिले Microphone permission दिनुहोस्।");return;}
+        if(hosting||connected||connecting){setStatus("पहिले Disconnect गर्नुहोस्, त्यसपछि Relay सुरु गर्नुहोस्।");return;}
+        if(Build.VERSION.SDK_INT>=31&&checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)!=PackageManager.PERMISSION_GRANTED){requestNeededPermissions();setStatus("Bluetooth Connect permission चाहिन्छ।");return;}
+        try{BluetoothDevice device=btAdapter.getRemoteDevice(mac);if(device.getBondState()!=BluetoothDevice.BOND_BONDED){setStatus("पहिले Android Bluetooth Settings मा Main Host सँग Pair गर्नुहोस्।");return;} }catch(Exception e){setStatus("Bluetooth MAC address गलत छ वा Device Pair भएको छैन।");return;}
+        relayMode=true;startHost();runOnUiThread(()->{bluetoothRelayBtn.setEnabled(false);relayBtn.setEnabled(false);hostBtn.setEnabled(false);role.setText("BLUETOOTH RELAY • "+mac);});
+        new Thread(()->{
+            try{
+                long deadline=System.currentTimeMillis()+7000;while((bluetoothServerSocket==null)&&System.currentTimeMillis()<deadline)Thread.sleep(100);
+                BluetoothDevice device=btAdapter.getRemoteDevice(mac);if(btAdapter.isDiscovering())btAdapter.cancelDiscovery();
+                BluetoothSocket socket=device.createRfcommSocketToServiceRecord(RELAY_BT_UUID);socket.connect();bluetoothUpstreamSocket=socket;bluetoothUpstreamOut=new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
+                setStatus("Bluetooth upstream connected. Downstream phones can join this relay over Wi-Fi/Hotspot.");readBluetoothUpstream(socket);
+            }catch(Exception e){setStatus("Bluetooth Relay connect failed: "+(e.getMessage()==null?"Pair both phones and retry":e.getMessage()));disconnectAll();}
+        },"bluetooth-relay-upstream").start();
+    }
+    void readBluetoothUpstream(BluetoothSocket socket){
+        try(DataInputStream in=new DataInputStream(new BufferedInputStream(socket.getInputStream()))){
+            while(relayMode&&socket.isConnected()){
+                int type=in.readUnsignedByte(),len=in.readInt();if(len<0||len>8192)break;byte[] data=new byte[len];in.readFully(data);
+                if(type==1){play(data);for(Client downstream:clients)downstream.send(type,data);for(BluetoothClient downstream:bluetoothClients)downstream.send(type,data);}
+                else if(type==2){startSchoolBellLocal();for(Client d:clients)d.send(type,new byte[]{1});for(BluetoothClient d:bluetoothClients)d.send(type,new byte[]{1});}
+                else if(type==3){stopSchoolBellLocal();for(Client d:clients)d.send(type,new byte[]{1});for(BluetoothClient d:bluetoothClients)d.send(type,new byte[]{1});}
+            }
+        }catch(Exception ignored){}finally{if(relayMode){setStatus("Bluetooth upstream disconnected.");disconnectAll();}}
+    }
+
+    void sendUpstream(int type,byte[] data){
+        DataOutputStream out=bluetoothUpstreamOut!=null?bluetoothUpstreamOut:clientOut;Socket s=clientSocket;BluetoothSocket bs=bluetoothUpstreamSocket;
+        if(!relayMode||out==null||((s==null||s.isClosed())&&(bs==null||!bs.isConnected())))return;
+        try{synchronized(writeLock){out.writeByte(type);out.writeInt(data.length);out.write(data);out.flush();}}
+        catch(IOException e){setStatus("Relay upstream link lost.");}
+    }
+
+    void startPresenceBeacon(){
+        new Thread(()->{
+            try(DatagramSocket ds=new DatagramSocket()){
+                ds.setBroadcast(true);
+                while(running){
+                    String ip=getLocalIp();
+                    String mode=hosting?"HOST":(connected?"CONNECTED":"SEARCHING");
+                    String msg="YUBARAJ_DEVICE:"+deviceName.replace("|"," ")+"|"+ip+"|"+mode;
+                    byte[] data=msg.getBytes("UTF-8");
+                    ds.send(new DatagramPacket(data,data.length,InetAddress.getByName("255.255.255.255"),DISCOVERY_PORT));
+                    Thread.sleep(1800);
+                }
+            }catch(Exception ignored){}
+        },"presence-beacon").start();
+    }
+
+    void sendBeacon(){
+        try(DatagramSocket ds=new DatagramSocket()){
+            ds.setBroadcast(true);
+            while(hosting){
+                String msg="YUBARAJ_HOST:"+getLocalIp()+"|"+deviceName.replace("|"," ");
+                byte[] data=msg.getBytes("UTF-8");
+                ds.send(new DatagramPacket(data,data.length,InetAddress.getByName("255.255.255.255"),DISCOVERY_PORT));
+                Thread.sleep(1000);
+            }
+        }catch(Exception ignored){}
+    }
+    String getLocalIp(){
+        try{
+            Enumeration<NetworkInterface> en=NetworkInterface.getNetworkInterfaces();
+            while(en.hasMoreElements()){NetworkInterface ni=en.nextElement();Enumeration<InetAddress> as=ni.getInetAddresses();while(as.hasMoreElements()){InetAddress a=as.nextElement();if(!a.isLoopbackAddress()&&a instanceof Inet4Address){String ip=a.getHostAddress();if(ip.startsWith("192.168.")||ip.startsWith("10.")||ip.startsWith("172."))return ip;}}}
+        }catch(Exception ignored){}
+        return "192.168.43.1";
+    }
+    void startDiscoveryListener(){
+        new Thread(()->{
+            try(DatagramSocket ds=new DatagramSocket(null)){
+                ds.setReuseAddress(true);ds.bind(new InetSocketAddress(DISCOVERY_PORT));ds.setBroadcast(true);byte[] buf=new byte[512];
+                while(running){
+                    DatagramPacket p=new DatagramPacket(buf,buf.length);ds.receive(p);
+                    String msg=new String(p.getData(),p.getOffset(),p.getLength(),"UTF-8");
+                    if(msg.startsWith("YUBARAJ_HOST:")&&!hosting){
+                        String val=msg.substring("YUBARAJ_HOST:".length()).trim();String[] parts=val.split("\\|",2);
+                        String ip=parts[0].trim();String name=parts.length>1?parts[1].trim():ip;
+                        if(!ip.equals(getLocalIp())){
+                            synchronized(peers){peers.put(ip,new Peer(ip,name,"HOST"));}
+                            if(!connected&&!connecting)hostAddress=ip;
+                            renderLists();
+                        }
+                    } else if(msg.startsWith("YUBARAJ_DEVICE:")){
+                        String val=msg.substring("YUBARAJ_DEVICE:".length()).trim();String[] parts=val.split("\\|",3);
+                        if(parts.length>=3){
+                            String name=parts[0].trim(), ip=parts[1].trim(), mode=parts[2].trim();
+                            if(!ip.equals(getLocalIp())){
+                                synchronized(peers){
+                                    Peer old=peers.get(ip);
+                                    if(old==null || !"HOST".equals(old.mode)) peers.put(ip,new Peer(ip,name,mode));
+                                    else {old.name=name; old.seen=System.currentTimeMillis();}
+                                }
+                                renderLists();
+                            }
+                        }
+                    }
+                }
+            }catch(Exception e){setStatus("Wi-Fi discovery unavailable. Check hotspot/network permissions.");}
+        },"discovery-listener").start();
+    }
+    void renderLists(){
+        runOnUiThread(()->{
+            if(wifiList==null||btList==null)return;
+            wifiList.removeAllViews();
+            ArrayList<Peer> list=new ArrayList<>();
+            synchronized(peers){long now=System.currentTimeMillis();Iterator<Map.Entry<String,Peer>> it=peers.entrySet().iterator();while(it.hasNext()){Peer p=it.next().getValue();if(now-p.seen>12000)it.remove();else list.add(p);}}
+            if(hosting){TextView own=new TextView(this);own.setText("🟢 "+deviceName+" (THIS PHONE — HOST)");own.setTextColor(Color.rgb(117,230,150));own.setPadding(10,8,10,8);wifiList.addView(own);}
+            if(list.isEmpty()&&!hosting){TextView empty=new TextView(this);empty.setText("No app host found yet. Same Wi-Fi/Hotspot चाहिन्छ.");empty.setTextColor(Color.LTGRAY);empty.setPadding(8,8,8,8);wifiList.addView(empty);}
+            for(Peer p:list){
+                String icon="HOST".equals(p.mode)?"🟢":"🔵";
+                String label=icon+" "+p.name+"   •   "+p.mode+"\\n"+p.ip;
+                Button item=button(label);
+                item.setGravity(Gravity.CENTER_VERTICAL);
+                if("HOST".equals(p.mode)){
+                    item.setOnClickListener(v->{hostAddress=p.ip;connectTo(p.ip);});
+                } else {
+                    item.setEnabled(false);
+                }
+                wifiList.addView(item,params());
+            }
+            btList.removeAllViews();
+            if(bluetoothPeers.isEmpty()){TextView empty=new TextView(this);empty.setText("Bluetooth scan चलिरहेको छ…");empty.setTextColor(Color.LTGRAY);empty.setPadding(8,8,8,8);btList.addView(empty);}
+            synchronized(bluetoothPeers){for(Map.Entry<String,String> e:bluetoothPeers.entrySet()){TextView item=new TextView(this);item.setText("🔵 "+e.getValue()+"  •  Bluetooth nearby");item.setTextColor(Color.rgb(150,205,255));item.setPadding(10,10,10,10);btList.addView(item);}}
+        });
+    }
+
+    void startBluetoothScan(){
+        if(btAdapter==null){setStatus("Bluetooth उपलब्ध छैन।");return;}
+        try{
+            if(Build.VERSION.SDK_INT>=31&&checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN)!=PackageManager.PERMISSION_GRANTED){requestNeededPermissions();return;}
+            if(!btAdapter.isEnabled()){setStatus("Bluetooth scan का लागि Bluetooth ON गर्नुहोस्।");return;}
+            if(btReceiver==null){
+                btReceiver=new BroadcastReceiver(){@Override public void onReceive(Context c,Intent i){
+                    String action=i.getAction();
+                    if(BluetoothDevice.ACTION_FOUND.equals(action)){
+                        BluetoothDevice d=i.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+                        if(d!=null){String name="Bluetooth device";try{if(Build.VERSION.SDK_INT<31||checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)==PackageManager.PERMISSION_GRANTED){if(d.getName()!=null)name=d.getName();}}catch(Exception ignored){}
+                            String key=d.getAddress();bluetoothPeers.put(key,name);renderLists();}
+                    } else if(BluetoothAdapter.ACTION_DISCOVERY_FINISHED.equals(action)){setStatus("Search complete. Choose a Wi-Fi host to talk; Bluetooth list is discovery only.");}
+                }};
+                IntentFilter f=new IntentFilter();f.addAction(BluetoothDevice.ACTION_FOUND);f.addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED);registerReceiver(btReceiver,f);
+            }
+            if(btAdapter.isDiscovering())btAdapter.cancelDiscovery();
+            btAdapter.startDiscovery();
+        }catch(SecurityException e){setStatus("Bluetooth permission चाहिन्छ।");}catch(Exception e){setStatus("Bluetooth search could not start.");}
+    }
+
+    void connectTo(String ip){
+        if(hosting||connected||connecting){if(hosting)setStatus("This phone is the host.");return;}
+        if(ip==null||ip.isEmpty())return;
+        connecting=true;
+        setStatus("Connecting to "+ip+"…");
+        new Thread(()->{
+            try{
+                Socket s=new Socket();s.connect(new InetSocketAddress(ip,AUDIO_PORT),5000);s.setTcpNoDelay(true);s.setKeepAlive(true);
+                clientSocket=s;clientOut=new DataOutputStream(new BufferedOutputStream(s.getOutputStream()));connected=true;connecting=false;connectedHostIp=ip;
+                runOnUiThread(()->{role.setText("CONNECTED TO "+ip);talkBtn.setEnabled(true);handsFreeBtn.setEnabled(true);bellBtn.setEnabled(true);musicBtn.setEnabled(true);videoBtn.setEnabled(true);hostBtn.setEnabled(false);});
+                setStatus("Connected. Hold HOLD TO TALK to speak.");
+                readServer(s);
+            }catch(Exception e){connected=false;connecting=false;setStatus("Connection failed. Confirm same hotspot and Host is running.");runOnUiThread(()->hostBtn.setEnabled(true));}
+        },"connect-host").start();
+    }
+    void readClient(Client c){
+        try(DataInputStream in=new DataInputStream(new BufferedInputStream(c.socket.getInputStream()))){
+            while(hosting&&!c.socket.isClosed()){
+                int type=in.readUnsignedByte();int len=in.readInt();if(len<0||len>8192)break;byte[] data=new byte[len];in.readFully(data);
+                if(type==1){play(data);for(Client other:clients)if(other!=c)other.send(type,data);for(BluetoothClient other:bluetoothClients)other.send(type,data);if(relayMode)sendUpstream(type,data);}
+                else if(type==2){
+                    // The host is authoritative: start locally and broadcast to EVERY client,
+                    // including the phone that requested the bell, so all devices stay in sync.
+                    startSchoolBellLocal();
+                    for(Client other:clients)other.send(2,new byte[]{1});for(BluetoothClient other:bluetoothClients)other.send(2,new byte[]{1});
+                    if(relayMode)sendUpstream(2,new byte[]{1});
+                }
+                else if(type==3){
+                    // Stop the bell on the host and every connected phone with one command.
+                    stopSchoolBellLocal();
+                    for(Client other:clients)other.send(3,new byte[]{1});for(BluetoothClient other:bluetoothClients)other.send(3,new byte[]{1});
+                    if(relayMode)sendUpstream(3,new byte[]{1});
+                }
+            }
+        }catch(Exception ignored){}finally{clients.remove(c);try{c.socket.close();}catch(Exception ignored){}if(hosting)setStatus("Node connected: "+(clients.size()+1)+"/14 devices (host/relay included)");}
+    }
+    void readServer(Socket s){
+        try(DataInputStream in=new DataInputStream(new BufferedInputStream(s.getInputStream()))){
+            while(connected&&!s.isClosed()){
+                int type=in.readUnsignedByte();int len=in.readInt();if(len<0||len>8192)break;byte[] data=new byte[len];in.readFully(data);if(type==1){play(data);if(relayMode){for(Client downstream:clients)downstream.send(type,data);for(BluetoothClient downstream:bluetoothClients)downstream.send(type,data);}} else if(type==2){startSchoolBellLocal();if(relayMode){for(Client downstream:clients)downstream.send(type,data);for(BluetoothClient downstream:bluetoothClients)downstream.send(type,data);}} else if(type==3){stopSchoolBellLocal();if(relayMode){for(Client downstream:clients)downstream.send(type,data);for(BluetoothClient downstream:bluetoothClients)downstream.send(type,data);}}
+            }
+        }catch(Exception ignored){}finally{
+            if(relayMode){setStatus("Relay upstream disconnected. Closing relay links.");disconnectAll();}
+            else if(!hosting){connected=false;handsFree=false;talking=false;stopService(new Intent(this, WalkieBackgroundService.class));stopSchoolBellLocal();setStatus("Disconnected from host.");runOnUiThread(()->{talkBtn.setEnabled(false);handsFreeBtn.setEnabled(false);handsFreeBtn.setText("🎙 HANDS-FREE: OFF");bellBtn.setEnabled(false);musicBtn.setEnabled(false);hostBtn.setEnabled(true);});}
+        }
+    }
+    void toggleHandsFree(){
+        if(handsFree){handsFree=false;talking=false;stopService(new Intent(this, WalkieBackgroundService.class));handsFreeBtn.setText("🎙 HANDS-FREE: OFF");setStatus("Hands-free बन्द भयो। बोल्न HOLD TO TALK थिचिराख्नुहोस्।");return;}
+        if(!connected&&!hosting){setStatus("पहिले एउटै Wi-Fi/Hotspot मा जोडिनुहोस् र Host खोज्नुहोस्।");return;}
+        if(checkSelfPermission(Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED){requestNeededPermissions();setStatus("Hands-Free सुरु गर्न Microphone अनुमति दिनुहोस्।");return;}
+        handsFree=true;handsFreeBtn.setText("⏹ HANDS-FREE: ON (STOP)");
+        // Keep the microphone capture/network process alive while the display is off.
+        Intent bgIntent=new Intent(this, WalkieBackgroundService.class);
+        if(Build.VERSION.SDK_INT>=26)startForegroundService(bgIntent);else startService(bgIntent);
+        setStatus("Hands-free चालु छ — Display बन्द/फोन Lock हुँदा पनि चलिरहने गरी Background Service सक्रिय छ।");
+        startTalking();
+    }
+    void startTalking(){
+        if(talking)return;
+        if(checkSelfPermission(Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED){requestNeededPermissions();setStatus("Microphone permission is required.");return;}
+        talking=true;setStatus("Talking… release the button to stop.");
+        new Thread(()->{
+            int min=AudioRecord.getMinBufferSize(SAMPLE_RATE,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT);
+            AudioRecord rec=null;
+            try{
+                rec=new AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION,SAMPLE_RATE,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT,Math.max(min,CHUNK*4));
+                if(rec.getState()!=AudioRecord.STATE_INITIALIZED)throw new Exception("Microphone could not start");
+                rec.startRecording();byte[] b=new byte[CHUNK];
+                // Hands-free voice activity detection: send speech only, plus a short
+                // hangover so the ends of words are not clipped. HOLD TO TALK stays raw.
+                long lastVoiceMs=0;
+                int voiceStartChunks=0;
+                while(talking){
+                    int n=rec.read(b,0,b.length);
+                    if(n>0){
+                        boolean sendAudio=true;
+                        if(handsFree){
+                            double sum=0;int samples=n/2;
+                            for(int i=0;i<samples;i++){
+                                int sample=(short)((b[i*2]&0xff)|((b[i*2+1]&0xff)<<8));
+                                sum+=(double)sample*sample;
+                            }
+                            double rms=samples>0?Math.sqrt(sum/samples):0;
+                            boolean voice=rms>=650.0;
+                            if(voice){voiceStartChunks++;lastVoiceMs=System.currentTimeMillis();}
+                            else voiceStartChunks=0;
+                            // Require two consecutive speech frames to reject clicks/noise;
+                            // retain 350 ms after speech to preserve word endings.
+                            sendAudio=(voiceStartChunks>=2)||(lastVoiceMs>0 && System.currentTimeMillis()-lastVoiceMs<=350);
+                        }
+                        if(sendAudio){
+                            byte[] packet=Arrays.copyOf(b,n);
+                            if(hosting){for(Client c:clients)c.send(1,packet);for(BluetoothClient c:bluetoothClients)c.send(1,packet);if(relayMode)sendUpstream(1,packet);}
+                            else if(clientOut!=null){synchronized(writeLock){clientOut.writeByte(1);clientOut.writeInt(n);clientOut.write(packet);clientOut.flush();}}
+                        }
+                    }
+                }
+            }catch(Exception e){setStatus("Microphone error: "+e.getMessage());}
+            finally{if(rec!=null){try{rec.stop();}catch(Exception ignored){}rec.release();}talking=false; if(handsFree && (connected||hosting) && running){try{Thread.sleep(300);}catch(InterruptedException ignored){} if(handsFree)startTalking();}}
+        },"audio-capture").start();
+    }
+    void startLocalVideoCall(){
+        if(!hosting && !connected){
+            setStatus("पहिले एउटै Wi-Fi/Hotspot मा Host सँग connect गर्नुहोस्।");
+            return;
+        }
+        if(checkSelfPermission(Manifest.permission.CAMERA)!=PackageManager.PERMISSION_GRANTED){
+            requestPermissions(new String[]{Manifest.permission.CAMERA}, 701);
+            setStatus("Video call का लागि Camera permission दिनुहोस्, त्यसपछि फेरि VIDEO CALL थिच्नुहोस्।");
+            return;
+        }
+        Intent i=new Intent(this, VideoCallActivity.class);
+        i.putExtra("host",hosting);
+        i.putExtra("hostIp",hosting ? getLocalIp() : connectedHostIp);
+        startActivity(i);
+    }
+
+    void toggleMusicCapture(){
+        if(musicCaptureActive){
+            musicCaptureActive=false;
+            try{if(musicCaptureRecord!=null){musicCaptureRecord.stop();musicCaptureRecord.release();}}catch(Exception ignored){}
+            musicCaptureRecord=null;
+            if(mediaProjection!=null){try{mediaProjection.stop();}catch(Exception ignored){} mediaProjection=null;}
+            stopService(new Intent(this, MusicCaptureService.class));
+            runOnUiThread(()->musicBtn.setText("🎵 HOLD TO SHARE MUSIC PLAYER AUDIO"));
+            setStatus("Music sharing stopped.");
+            return;
+        }
+        if(!hosting&&!connected){setStatus("पहिले Host मा connect गर्नुहोस्।");return;}
+        if(Build.VERSION.SDK_INT<29){setStatus("Music audio sharing requires Android 10 or newer.");return;}
+        MediaProjectionManager mgr=(MediaProjectionManager)getSystemService(MEDIA_PROJECTION_SERVICE);
+        if(mgr==null){setStatus("This phone does not support audio capture.");return;}
+        musicCaptureRequested=true;
+        startActivityForResult(mgr.createScreenCaptureIntent(),REQ_MEDIA_CAPTURE);
+    }
+
+    @Override protected void onActivityResult(int requestCode,int resultCode,Intent data){
+        super.onActivityResult(requestCode,resultCode,data);
+        if(requestCode!=REQ_MEDIA_CAPTURE)return;
+        if(resultCode!=RESULT_OK||data==null){musicCaptureRequested=false;setStatus("Music sharing permission was not granted.");return;}
+        try{
+            // Android requires an active mediaProjection foreground service before creating the projection.
+            Intent serviceIntent = new Intent(this, MusicCaptureService.class);
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(serviceIntent); else startService(serviceIntent);
+            MediaProjectionManager mgr=(MediaProjectionManager)getSystemService(MEDIA_PROJECTION_SERVICE);
+            mediaProjection=mgr.getMediaProjection(resultCode,data);
+            AudioPlaybackCaptureConfiguration config=new AudioPlaybackCaptureConfiguration.Builder(mediaProjection)
+                    .addMatchingUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                    .addMatchingUsage(android.media.AudioAttributes.USAGE_GAME)
+                    .build();
+            AudioFormat format=new AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(SAMPLE_RATE).setChannelMask(AudioFormat.CHANNEL_IN_MONO).build();
+            int min=AudioRecord.getMinBufferSize(SAMPLE_RATE,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT);
+            musicCaptureRecord=new AudioRecord.Builder().setAudioFormat(format).setBufferSizeInBytes(Math.max(min,CHUNK*8))
+                    .setAudioPlaybackCaptureConfig(config).build();
+            musicCaptureActive=true;musicCaptureRequested=false;
+            musicBtn.setText("■ STOP SHARING MUSIC AUDIO");
+            setStatus("Music audio sharing started. Play music in your Music Player. Some apps may block capture.");
+            new Thread(()->{
+                byte[] buffer=new byte[CHUNK];
+                try{
+                    musicCaptureRecord.startRecording();
+                    while(musicCaptureActive){int n=musicCaptureRecord.read(buffer,0,buffer.length);
+                        if(n>0){byte[] packet=Arrays.copyOf(buffer,n);
+                            if(hosting){play(packet);for(Client c:clients)c.send(1,packet);for(BluetoothClient c:bluetoothClients)c.send(1,packet);if(relayMode)sendUpstream(1,packet);}
+                            else if(connected&&clientOut!=null){synchronized(writeLock){clientOut.writeByte(1);clientOut.writeInt(n);clientOut.write(packet);clientOut.flush();}}
+                        }
+                    }
+                }catch(Exception e){setStatus("Music capture stopped: "+e.getMessage());}
+                finally{musicCaptureActive=false;try{if(musicCaptureRecord!=null){musicCaptureRecord.stop();musicCaptureRecord.release();}}catch(Exception ignored){}musicCaptureRecord=null;
+                    if(mediaProjection!=null){try{mediaProjection.stop();}catch(Exception ignored){}mediaProjection=null;}
+                    runOnUiThread(()->{if(musicBtn!=null)musicBtn.setText("🎵 HOLD TO SHARE MUSIC PLAYER AUDIO");});}
+            },"music-audio-capture").start();
+        }catch(Exception e){musicCaptureActive=false;musicCaptureRequested=false;setStatus("Could not start music capture: "+e.getMessage());}
+    }
+
+    void toggleSchoolBell(){
+        // Keep the button action safe even if Android reports a stale network/audio state.
+        try {
+            sendSchoolBellCommand(bellActive ? 3 : 2);
+        } catch (Throwable e) {
+            setStatus("Bell could not start. Please reconnect to the Host and try again.");
+        }
+    }
+
+    void sendSchoolBellCommand(int command){
+        final byte[] data=new byte[]{1};
+        if(hosting){
+            // Host starts/stops its own bell, then broadcasts the same state to all clients.
+            if(command==2) startSchoolBellLocal(); else stopSchoolBellLocal();
+            for(Client c:clients)c.send(command,data);for(BluetoothClient c:bluetoothClients)c.send(command,data);
+            if(relayMode)sendUpstream(command,data);
+            setStatus(command==2 ? "🔔 School Bell started on this phone and all connected phones." : "🔕 School Bell stopped on all connected phones.");
+            return;
+        }
+        Socket activeSocket=clientSocket;
+        DataOutputStream activeOut=clientOut;
+        if(connected && activeSocket!=null && activeOut!=null && activeSocket.isConnected() && !activeSocket.isClosed()){
+            try{
+                synchronized(writeLock){
+                    activeOut.writeByte(command);
+                    activeOut.writeInt(data.length);
+                    activeOut.write(data);
+                    activeOut.flush();
+                }
+                // Do not start/stop locally here. Wait for the host's broadcast so the
+                // requesting phone and every other phone follow one authoritative command.
+                setStatus(command==2 ? "🔔 Bell start command sent to Host…" : "🔕 Bell stop command sent to Host…");
+            }catch(Exception e){
+                connected=false;
+                try{activeSocket.close();}catch(Exception ignored){}
+                runOnUiThread(()->{talkBtn.setEnabled(false);handsFreeBtn.setEnabled(false);handsFree=false;talking=false;handsFreeBtn.setText("🎙 HANDS-FREE: OFF");bellBtn.setEnabled(false);musicBtn.setEnabled(false);hostBtn.setEnabled(true);role.setText("DISCONNECTED — SEARCH HOST AGAIN");});
+                setStatus("Host connection was lost. Tap SEARCH OFFLINE DEVICES to reconnect.");
+            }
+        }else{
+            connected=false;
+            setStatus("Host is not connected. Search and connect to the Host again.");
+        }
+    }
+
+    void updateBellButton(){
+        runOnUiThread(()->{
+            if(bellBtn!=null){
+                bellBtn.setText(bellActive ? "🔕 STOP SCHOOL BELL" : "🔔 START SCHOOL BELL");
+                bellBtn.setBackgroundTintList(android.content.res.ColorStateList.valueOf(bellActive ? Color.rgb(170,45,45) : Color.rgb(170,105,25)));
+            }
+        });
+    }
+
+    void startSchoolBellLocal(){
+        runOnUiThread(()->{
+            try{
+                if(bellActive)return;
+                android.net.Uri uri=RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM);
+                if(uri==null)uri=RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION);
+                if(uri==null){setStatus("Bell sound is not available on this phone.");return;}
+                bellRingtone=RingtoneManager.getRingtone(getApplicationContext(),uri);
+                if(bellRingtone==null){setStatus("Bell sound is not available on this phone.");return;}
+                if(Build.VERSION.SDK_INT>=21){
+                    bellRingtone.setAudioAttributes(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build());
+                }else{bellRingtone.setStreamType(AudioManager.STREAM_ALARM);}
+                if(Build.VERSION.SDK_INT>=28)bellRingtone.setLooping(true);
+                bellActive=true;
+                bellRingtone.play();
+                if(Build.VERSION.SDK_INT<28)bellHandler.postDelayed(bellRepeat,2500);
+                updateBellButton();
+            }catch(Throwable e){bellActive=false;updateBellButton();setStatus("Bell sound could not play on this phone.");}
+        });
+    }
+
+    void stopSchoolBellLocal(){
+        runOnUiThread(()->{
+            bellActive=false;
+            bellHandler.removeCallbacks(bellRepeat);
+            try{if(bellRingtone!=null && bellRingtone.isPlaying())bellRingtone.stop();}catch(Throwable ignored){}
+            updateBellButton();
+            setStatus("🔕 School Bell stopped.");
+        });
+    }
+
+    void stopTalking(){talking=false;setStatus("Ready to talk.");}
+    synchronized void play(byte[] pcm){
+        try{
+            if(player==null){
+                int min=AudioTrack.getMinBufferSize(SAMPLE_RATE,AudioFormat.CHANNEL_OUT_MONO,AudioFormat.ENCODING_PCM_16BIT);
+                player=new AudioTrack(AudioManager.STREAM_MUSIC,SAMPLE_RATE,AudioFormat.CHANNEL_OUT_MONO,AudioFormat.ENCODING_PCM_16BIT,Math.max(min,CHUNK*12),AudioTrack.MODE_STREAM);
+                player.play();
+            }
+            player.write(pcm,0,pcm.length);
+        }catch(Exception ignored){}
+    }
+    void disconnectAll(){
+        talking=false;handsFree=false;musicCaptureActive=false;connected=false;connectedHostIp="";hosting=false;connecting=false;relayMode=false;
+        stopService(new Intent(this, WalkieBackgroundService.class));
+        stopSchoolBellLocal();
+        try{if(serverSocket!=null)serverSocket.close();}catch(Exception ignored){}
+        try{if(clientSocket!=null)clientSocket.close();}catch(Exception ignored){}
+        try{if(bluetoothUpstreamSocket!=null)bluetoothUpstreamSocket.close();}catch(Exception ignored){}
+        try{if(bluetoothServerSocket!=null)bluetoothServerSocket.close();}catch(Exception ignored){}
+        bluetoothUpstreamOut=null;bluetoothUpstreamSocket=null;
+        for(BluetoothClient c:bluetoothClients)try{c.socket.close();}catch(Exception ignored){}bluetoothClients.clear();
+        for(Client c:clients)try{c.socket.close();}catch(Exception ignored){}clients.clear();
+        runOnUiThread(()->{talkBtn.setEnabled(false);handsFreeBtn.setEnabled(false);handsFreeBtn.setText("🎙 HANDS-FREE: OFF");bellBtn.setEnabled(false);if(videoBtn!=null)videoBtn.setEnabled(false);role.setText("Searching…");hostBtn.setEnabled(true);if(relayBtn!=null)relayBtn.setEnabled(true);if(bluetoothRelayBtn!=null)bluetoothRelayBtn.setEnabled(true);});
+        setStatus("Disconnected. Auto search continues.");
+    }
+    @Override public void onDestroy(){
+        if(instance==this) instance=null;
+        running=false;
+        bellActive=false;bellHandler.removeCallbacks(bellRepeat);
+        try{if(bellRingtone!=null && bellRingtone.isPlaying())bellRingtone.stop();}catch(Exception ignored){}
+        disconnectAll();
+        try{if(btAdapter!=null&&btAdapter.isDiscovering())btAdapter.cancelDiscovery();}catch(Exception ignored){}
+        if(btReceiver!=null){try{unregisterReceiver(btReceiver);}catch(Exception ignored){}}
+        if(player!=null){player.release();player=null;}
+        if(multicastLock!=null&&multicastLock.isHeld())multicastLock.release();
+        super.onDestroy();
+    }
+}
