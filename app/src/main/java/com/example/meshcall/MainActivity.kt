@@ -28,7 +28,7 @@ class MainActivity : Activity() {
  private var egl:EglBase?=null
  private var renderersReady=false
  private var rtcInitializing=false
- private val localId="${android.os.Build.MODEL}-${System.currentTimeMillis()}"
+ private val localId=java.util.UUID.randomUUID().toString()
  private var mute=false
  private var cam=true
  private val uiHandler=android.os.Handler(android.os.Looper.getMainLooper())
@@ -87,9 +87,9 @@ class MainActivity : Activity() {
  }
  private fun startNetwork(){
   val display=name.text.toString().trim().ifBlank{"Android-${android.os.Build.MODEL}"}
-  signal?.stop();signal=SignalServer(onMessage={msg,addr->runOnUiThread{mesh?.receive(msg,addr)}}).also{it.start()}
-  discovery?.stop();discovery=LanDiscovery(this,display){p->runOnUiThread{peers[p.id]=p;renderPeerList()}}.also{it.start()}
-  status.text="Searching LAN… Make sure both phones use the same Wi-Fi/hotspot."
+  signal?.stop();signal=SignalServer(onMessage={msg,addr->runOnUiThread{mesh?.receive(msg,addr)}}, onError={err->runOnUiThread{status.text=err}}).also{it.start()}
+  discovery?.stop();discovery=LanDiscovery(this,display,localId){p->runOnUiThread{peers[p.id]=p;renderPeerList()}}.also{it.start()}
+  status.text="Searching local network (Internet not required)… Keep both phones on the same hotspot/Wi-Fi."
   uiHandler.removeCallbacks(refreshPeers);uiHandler.post(refreshPeers)
  }
  private fun initRtc(){
@@ -98,7 +98,7 @@ class MainActivity : Activity() {
   rtcInitializing=true
   try{
    if(!renderersReady){egl=EglBase.create();remoteRenderer.init(egl!!.eglBaseContext,null);localRenderer.init(egl!!.eglBaseContext,null);remoteRenderer.setEnableHardwareScaler(true);localRenderer.setEnableHardwareScaler(true);renderersReady=true}
-   if(signal==null) signal=SignalServer(onMessage={msg,addr->runOnUiThread{mesh?.receive(msg,addr)}}).also{it.start()}
+   if(signal==null) signal=SignalServer(onMessage={msg,addr->runOnUiThread{mesh?.receive(msg,addr)}}, onError={err->runOnUiThread{status.text=err}}).also{it.start()}
    mesh=WebRtcMesh(this,signal!!,localId,{s->runOnUiThread{
     status.text=s
     if(s.contains("ICE: CONNECTED")||s.contains("ICE: COMPLETED")){ val address=s.substringBefore(" ICE:");connectedAddresses.add(address);renderPeerList() }
