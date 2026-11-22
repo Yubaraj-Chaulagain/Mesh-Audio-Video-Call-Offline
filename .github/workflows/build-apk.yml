@@ -1,0 +1,87 @@
+name: MeshCall Offline APK Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'app/**'
+      - 'gradle/**'
+      - '*.gradle'
+      - '*.gradle.kts'
+      - 'gradle.properties'
+      - 'settings.gradle'
+      - '.github/workflows/build-apk.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Auto Version
+        id: version
+        run: |
+          VERSION_CODE=${GITHUB_RUN_NUMBER}
+          VERSION_NAME="1.0.${GITHUB_RUN_NUMBER}"
+
+          echo "version_code=$VERSION_CODE" >> $GITHUB_OUTPUT
+          echo "version_name=$VERSION_NAME" >> $GITHUB_OUTPUT
+
+      - name: Build APK
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug \
+          -PversionCode=${{ steps.version.outputs.version_code }} \
+          -PversionName=${{ steps.version.outputs.version_name }}
+
+      - name: Prepare Release
+        run: |
+          mkdir -p release
+
+          cp app/build/outputs/apk/debug/app-debug.apk \
+          release/MeshCall-Offline.apk
+
+          cat > release/latest.json << EOF
+          {
+            "versionCode": ${{ steps.version.outputs.version_code }},
+            "versionName": "${{ steps.version.outputs.version_name }}",
+            "downloadUrl": "https://github.com/${{ github.repository }}/releases/latest/download/MeshCall-Offline.apk",
+            "releaseUrl": "https://github.com/${{ github.repository }}/releases/latest",
+            "appName": "MeshCall Offline"
+          }
+          EOF
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version_name }}
+          name: MeshCall Offline v${{ steps.version.outputs.version_name }}
+          body: |
+            MeshCall Offline Update
+
+            Version Name: ${{ steps.version.outputs.version_name }}
+            Version Code: ${{ steps.version.outputs.version_code }}
+
+            Download MeshCall Offline APK below.
+          files: |
+            release/MeshCall-Offline.apk
+            release/latest.json
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
