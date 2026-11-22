@@ -17,7 +17,6 @@ class MainActivity : Activity() {
  private lateinit var status:TextView
  private lateinit var peersView:TextView
  private lateinit var countView:TextView
- private lateinit var name:EditText
  private var discovery:LanDiscovery?=null
  private var signal:SignalServer?=null
  private var mesh:WebRtcMesh?=null
@@ -42,7 +41,7 @@ class MainActivity : Activity() {
   super.onCreate(savedInstanceState)
   val box=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;setPadding(16,16,16,16)}
   box.addView(TextView(this).apply{text="MeshCall Offline\nLAN Audio / Video";textSize=22f})
-  name=EditText(this).apply{hint="Your display name";setSingleLine(true)};box.addView(name)
+  box.addView(TextView(this).apply{text="Device name: automatic (no typing required)";textSize=14f})
   status=TextView(this).apply{text="Status: Ready";textSize=16f};box.addView(status)
   countView=TextView(this).apply{text="Nearby devices: 0 | Connected: 0";textSize=16f};box.addView(countView)
   peersView=TextView(this).apply{text="Nearby devices will appear here."};box.addView(peersView)
@@ -80,13 +79,13 @@ class MainActivity : Activity() {
  private fun renderPeerList(){
   val list=peers.values.sortedBy{it.name.lowercase()}
   countView.text="Nearby devices: ${list.size} | Connected: ${connectedAddresses.size}"
-  peersView.text=if(list.isEmpty()) "No devices found yet.\n1) Connect both phones to the same Wi-Fi or one phone's hotspot.\n2) Enter a different display name on each phone.\n3) Press START SEARCHING DEVICES." else "FOUND DEVICES\n"+list.joinToString("\n\n") { p ->
+  peersView.text=if(list.isEmpty()) "No devices found yet.\n1) Connect both phones to the same Wi-Fi or one phone's hotspot.\n2) Press START SEARCHING DEVICES on both phones.\n3) Initialize Audio + Camera, then choose Audio Call or Video Call." else "FOUND DEVICES\n"+list.joinToString("\n\n") { p ->
    val connected=connectedAddresses.contains(p.address)
    "${p.name}\n${p.address}\n${if(connected)"🟢 CONNECTED" else "🟡 FOUND — not connected yet"}"
   }
  }
  private fun startNetwork(){
-  val display=name.text.toString().trim().ifBlank{"Android-${android.os.Build.MODEL}"}
+  val display="${android.os.Build.MODEL.ifBlank { "Android" }}-${localId.take(4)}"
   signal?.stop();signal=SignalServer(onMessage={msg,addr->runOnUiThread{mesh?.receive(msg,addr)}}, onError={err->runOnUiThread{status.text=err}}).also{it.start()}
   discovery?.stop();discovery=LanDiscovery(this,display,localId){p->runOnUiThread{peers[p.id]=p;renderPeerList()}}.also{it.start()}
   status.text="Searching local network (Internet not required)… Keep both phones on the same hotspot/Wi-Fi."
