@@ -46,6 +46,10 @@ class LanDiscovery(private val context: Context, private val displayName: String
             } catch (_: Exception) { }
         }
     }
-    fun snapshot(): List<Peer> = peers.values.sortedBy { it.name }
+    fun snapshot(): List<Peer> {
+        val now = System.currentTimeMillis()
+        peers.entries.removeIf { now - it.value.lastSeen > 9000 }
+        return peers.values.sortedBy { it.name }
+    }
     fun stop() { job?.cancel(); job = null; try { socket?.close() } catch (_: Exception) {}; socket = null; try { lock?.release() } catch (_: Exception) {}; lock = null }
 }

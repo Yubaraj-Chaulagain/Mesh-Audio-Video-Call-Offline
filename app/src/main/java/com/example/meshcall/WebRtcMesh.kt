@@ -12,8 +12,14 @@ class WebRtcMesh(private val context: Context, private val signal: SignalServer,
     private val pcs=ConcurrentHashMap<String,PeerConnection>(); private val pendingIce=ConcurrentHashMap<String,MutableList<IceCandidate>>()
     private var factory:PeerConnectionFactory?=null; private var audio:AudioTrack?=null; private var video:VideoTrack?=null
     private var capturer:CameraVideoCapturer?=null; private var texture:SurfaceTextureHelper?=null; private var videoSource:VideoSource?=null
+    companion object { @Volatile private var webrtcInitialized = false }
     fun initialize(){
-        PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(context).createInitializationOptions())
+        synchronized(WebRtcMesh::class.java) {
+            if (!webrtcInitialized) {
+                PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(context).createInitializationOptions())
+                webrtcInitialized = true
+            }
+        }
         factory=PeerConnectionFactory.builder().setVideoEncoderFactory(DefaultVideoEncoderFactory(null,true,true)).setVideoDecoderFactory(DefaultVideoDecoderFactory(null)).createPeerConnectionFactory()
         val f=factory!!; audio=f.createAudioTrack("mesh-audio",f.createAudioSource(MediaConstraints()))
         val src=f.createVideoSource(false); videoSource=src; texture=SurfaceTextureHelper.create("MeshCallCamera",eglContext)
