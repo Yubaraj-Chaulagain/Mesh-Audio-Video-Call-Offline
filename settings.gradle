@@ -2,6 +2,8 @@ pluginManagement {
     repositories {
         google()
         mavenCentral()
+        // WebRTC artifact mirror (the original Bintray repository is discontinued)
+        maven { url 'https://raw.githubusercontent.com/QuickBlox/quickblox-android-sdk-releases/master/' }
         gradlePluginPortal()
     }
 }
@@ -11,6 +13,8 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // WebRTC artifact mirror (the original Bintray repository is discontinued)
+        maven { url 'https://raw.githubusercontent.com/QuickBlox/quickblox-android-sdk-releases/master/' }
     }
 }
 
